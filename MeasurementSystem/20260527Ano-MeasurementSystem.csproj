@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net10.0-windows</TargetFramework>
+		<Nullable>enable</Nullable>
+		<UseWindowsForms>true</UseWindowsForms>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<RuntimeHostConfigurationOption Include="System.Drawing.EnableUnixSupport" Value="true" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="System.Drawing.Common" Version="10.0.3" />
+		<PackageReference Include="OpenCvSharp4" Version="4.13.0.20260222" />
+		<PackageReference Include="OpenCvSharp4.Extensions" Version="4.13.0.20260222" />
+		<PackageReference Include="OpenCvSharp4.runtime.win" Version="4.13.0.20260222" />
+		<PackageReference Include="System.Configuration.ConfigurationManager" Version="9.0.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="TeliCamDNet4_0Api64">
+			<HintPath>..\..\..\..\..\..\..\Program Files\TOSHIBA TELI\TeliCamSDK\TeliCamApi\bin\x64\TeliCamDNet4_0Api64.dll</HintPath>
+		</Reference>
+	</ItemGroup>
+
+</Project>
