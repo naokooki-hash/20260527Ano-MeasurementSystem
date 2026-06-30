@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using OpenCvSharp;
 using OpenCvSharp.Extensions;
 
+// 名前の衝突を防ぐためのエイリアス定義
 using Point = System.Drawing.Point;
 using Size = System.Drawing.Size;
 using Timer = System.Windows.Forms.Timer;
@@ -17,456 +18,460 @@ namespace MeasurementSystem
 {
     public partial class Form1 : Form
     {
-        // ==========================================
-        // 1. 変数定義
-        // ==========================================
-        private ICamera camera;
-        private bool _isCapturing = false;
-        private bool _isLoadingConfig = false;
+        private ICamera cameraL;
+        private ICamera cameraR;
+        private MeasurementEngine _engineL = new MeasurementEngine();
+        private MeasurementEngine _engineR = new MeasurementEngine();
 
-        private readonly object _bmpLock = new object();
-        private readonly object _dataLock = new object();
+        private double _currentValL = 0, _lastPxL = 0, _lastCenterYL = 1024;
+        private double _currentValR = 0, _lastPxR = 0, _lastCenterYR = 1024;
+        private bool _isOkL = false, _isOkR = false;
 
-        private Bitmap _currentDisplayBmp = null;
-        private Mat _lastDispMat = null;
-        private MeasurementResult _lastResult = null;
-        private double _lastCenterY = 1024;
-        private bool _isFirstFrame = true;
+        private double _mmPerPixelTopL = 0.176, _mmPerPixelMidL = 0.176, _mmPerPixelBotL = 0.176;
+        private double _refYTopL = 400.0, _refYMidL = 1024.0, _refYBotL = 1600.0;
+        private double _mmPerPixelTopR = 0.176, _mmPerPixelMidR = 0.176, _mmPerPixelBotR = 0.176;
+        private double _refYTopR = 400.0, _refYMidR = 1024.0, _refYBotR = 1600.0;
 
-        private float _zoom = 1.0f;
-        private PointF _offset = new PointF(0, 0);
-        private bool _isDragging = false;
-        private Point _lastMousePos;
+        private const string AdminPassword = "admin";
 
-        private string _savePath = @"C:\InspectionData";
-        private int _saveMode = 1;
-        private int _resizeMode = 0;
-        private int _deleteDays = 30;
-        private bool _isAdmin = false;
-        private const string ADMIN_PASS = "admin";
-
-        private int _roiX = 427, _roiY = 703, _roiWidth = 1320, _roiHeight = 800;
-        private double _mmPerPixelTop = 0.176, _mmPerPixelMid = 0.176, _mmPerPixelBot = 0.176;
-        private double _refYTop = 400.0, _refYMid = 1024.0, _refYBot = 1600.0;
-
-        private double _targetPitch = 100.0, _tolPlus = 0.5, _tolMinus = 0.5, _tolAngle = 1.0;
-
-        private int _processIntervalMs = 100;
-        private int _updateIntervalMs = 500;
-        private DateTime _lastProcessTime = DateTime.MinValue;
-        private DateTime _lastUiUpdate = DateTime.MinValue;
-
-        private PictureBox pictureBox1;
-        private Label lblBigResult, lblPitch, lblDiameterL, lblDiameterR, lblAngle;
         private TabControl mainTabControl;
         private TabPage tabPageMain, tabPageSettings;
 
-        private Panel pnlAdminControls;
-        private Button btnAdminLock;
+        private Label lblBigResult;
         private TextBox txtSavePath;
-        private ComboBox cmbSaveMode, cmbResizeMode;
-        private NumericUpDown numDeleteDays;
-        private NumericUpDown numMmTop, numMmMid, numMmBot, numYTop, numYMid, numYBot;
+        private TableLayoutPanel pnlCameraViews;
+        private PictureBox picLeft, picRight;
+
+        // UIコントロール
+        private NumericUpDown numTarget, numTolPlus, numTolMinus, numRoiWidth, numRoiHeight;
+        private NumericUpDown numMaxAngle, numUpdateInterval, numLogKeepDays;
+        private NumericUpDown numThreshold; // 二値化閾値
         private TrackBar trackBarRoiX, trackBarRoiY;
-        private NumericUpDown numRoiX, numRoiY, numRoiWidth, numRoiHeight;
-        private NumericUpDown numTargetPitch, numTolPlus, numTolMinus, numTolAngle, numUpdateInterval, numProcessInterval;
+        private ComboBox cmbSaveImageMode, cmbSaveScale, cmbTargetCamera;
+        private Label lblCalibStatus;
+
+        private DateTime _lastTextUpdate = DateTime.MinValue;
+        private Bitmap _bmpL, _bmpR;
+        private readonly object _bmpLock = new object();
 
         public Form1()
         {
             InitializeCustomUI();
-            LoadConfig();
-            DeleteOldLogs();
+            LoadAppConfig();
 
-            camera = new TeliCamera();
+            try
+            {
+                cameraL = new TeliCamera(0);
+                cameraR = new TeliCamera(1);
+            }
+            catch { MessageBox.Show("カメラの初期化（2台接続）でエラーが発生しました。"); }
+
+            this.KeyPreview = true;
+            this.KeyDown += (s, e) => { if (e.KeyCode == Keys.Space) SaveData(); };
             this.Load += (s, e) => {
-                if (camera.Initialize())
+                if (cameraL != null && cameraL.Initialize())
                 {
-                    camera.OnFrameCaptured += Camera_OnFrameCaptured;
-                    _isCapturing = true;
-                    camera.StartCapture();
+                    cameraL.OnFrameCaptured += CameraL_OnFrameCaptured;
+                    cameraL.StartCapture();
                 }
-                else
+                if (cameraR != null && cameraR.Initialize())
                 {
-                    MessageBox.Show("カメラの初期化に失敗しました。USB接続を確認してください。", "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    cameraR.OnFrameCaptured += CameraR_OnFrameCaptured;
+                    cameraR.StartCapture();
                 }
+            };
+            this.FormClosing += (s, e) => {
+                SaveAppConfig();
+                cameraL?.Terminate();
+                cameraR?.Terminate();
             };
         }
 
-        // ==========================================
-        // 2. UIの動的生成 と マウスイベント設定
-        // ==========================================
         private void InitializeCustomUI()
         {
-            this.Text = "光学検査システム (ソフトウェアトリガー搭載版)";
-            this.Size = new Size(1500, 950);
-            this.FormClosing += Form1_FormClosing;
+            this.Text = "FA AI Inspection System - Dual Camera Model";
+            this.Size = new Size(1600, 950);
 
-            pictureBox1 = new PictureBox { Location = new Point(10, 10), Size = new Size(1100, 850), BorderStyle = BorderStyle.FixedSingle, BackColor = Color.Black };
-            pictureBox1.Paint += PictureBox1_Paint;
-            pictureBox1.MouseDown += PictureBox1_MouseDown;
-            pictureBox1.MouseMove += PictureBox1_MouseMove;
-            pictureBox1.MouseUp += PictureBox1_MouseUp;
-            pictureBox1.MouseWheel += PictureBox1_MouseWheel;
-            pictureBox1.MouseEnter += (s, e) => pictureBox1.Focus();
-            pictureBox1.DoubleClick += (s, e) => ResetZoom();
-            this.Controls.Add(pictureBox1);
-
-            mainTabControl = new TabControl { Location = new Point(1120, 10), Size = new Size(350, 850) };
+            mainTabControl = new TabControl { Dock = DockStyle.Fill, Appearance = TabAppearance.FlatButtons, ItemSize = new Size(0, 1), SizeMode = TabSizeMode.Fixed };
             this.Controls.Add(mainTabControl);
-            tabPageMain = new TabPage("メイン"); tabPageSettings = new TabPage("設定");
-            mainTabControl.TabPages.Add(tabPageMain); mainTabControl.TabPages.Add(tabPageSettings);
 
-            // --- メインタブ ---
-            lblBigResult = new Label { Text = "WAIT", Font = new Font("Segoe UI", 56, FontStyle.Bold), Location = new Point(10, 15), Size = new Size(320, 100), TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.Gray, ForeColor = Color.White };
-            tabPageMain.Controls.Add(lblBigResult);
+            tabPageMain = new TabPage { Text = "Main" };
+            mainTabControl.TabPages.Add(tabPageMain);
 
-            Font resultFont = new Font("Segoe UI", 20, FontStyle.Bold);
-            lblPitch = new Label { Location = new Point(10, 140), Size = new Size(320, 40), Font = resultFont };
-            lblDiameterL = new Label { Location = new Point(10, 190), Size = new Size(320, 40), Font = resultFont };
-            lblDiameterR = new Label { Location = new Point(10, 240), Size = new Size(320, 40), Font = resultFont };
-            lblAngle = new Label { Location = new Point(10, 290), Size = new Size(320, 40), Font = resultFont };
-            tabPageMain.Controls.Add(lblPitch); tabPageMain.Controls.Add(lblDiameterL); tabPageMain.Controls.Add(lblDiameterR); tabPageMain.Controls.Add(lblAngle);
+            Panel pnlOperator = new Panel { Dock = DockStyle.Right, Width = 280, BackColor = Color.FromArgb(45, 45, 48), ForeColor = Color.White };
+            tabPageMain.Controls.Add(pnlOperator);
 
-            Button btnStart = new Button { Text = "Start", Location = new Point(10, 340), Size = new Size(150, 50), Font = new Font("Segoe UI", 12, FontStyle.Bold), BackColor = Color.LightBlue };
-            btnStart.Click += (s, e) => { _isCapturing = true; camera?.StartCapture(); }; tabPageMain.Controls.Add(btnStart);
+            Panel pnlBottomSave = new Panel { Dock = DockStyle.Bottom, Height = 120 };
+            Button btnSaveLog = new Button { Text = "💾 記録 (SAVE)", Size = new Size(240, 90), Location = new Point(20, 10), BackColor = Color.FromArgb(0, 122, 204), FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 16, FontStyle.Bold) };
+            btnSaveLog.Click += (s, e) => SaveData();
+            pnlBottomSave.Controls.Add(btnSaveLog);
+            pnlOperator.Controls.Add(pnlBottomSave);
 
-            Button btnStop = new Button { Text = "Stop", Location = new Point(170, 340), Size = new Size(150, 50), Font = new Font("Segoe UI", 12, FontStyle.Bold), BackColor = Color.LightCoral };
-            btnStop.Click += (s, e) => { _isCapturing = false; camera?.StopCapture(); }; tabPageMain.Controls.Add(btnStop);
+            pnlCameraViews = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, BackColor = Color.Black };
+            pnlCameraViews.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
+            pnlCameraViews.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
 
-            Button btnRecord = new Button { Text = "保存 (Spaceキー)", Location = new Point(10, 410), Size = new Size(310, 60), Font = new Font("Segoe UI", 16, FontStyle.Bold), BackColor = Color.LightGreen };
-            btnRecord.Click += (s, e) => SaveMeasurementData(); tabPageMain.Controls.Add(btnRecord);
+            picLeft = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom };
+            picRight = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom };
+            pnlCameraViews.Controls.Add(picLeft, 0, 0);
+            pnlCameraViews.Controls.Add(picRight, 1, 0);
+            tabPageMain.Controls.Add(pnlCameraViews);
 
-            // --- 設定タブ ---
-            btnAdminLock = new Button { Text = "管理者ロック解除", Location = new Point(10, 10), Size = new Size(315, 40), Font = new Font("Segoe UI", 12, FontStyle.Bold), BackColor = Color.Orange };
-            btnAdminLock.Click += BtnAdminLock_Click; tabPageSettings.Controls.Add(btnAdminLock);
-            pnlAdminControls = new Panel { Location = new Point(0, 60), Size = new Size(340, 750), AutoScroll = true, Enabled = false };
-            tabPageSettings.Controls.Add(pnlAdminControls);
+            int opY = 15;
+            lblBigResult = new Label { Text = "READY", Location = new Point(15, opY), Width = 240, Height = 70, Font = new Font("Segoe UI", 24, FontStyle.Bold), BackColor = Color.FromArgb(28, 28, 28), ForeColor = Color.Gray, TextAlign = ContentAlignment.MiddleCenter };
+            pnlOperator.Controls.Add(lblBigResult); opY += 95;
 
-            int yPos = 0;
-            AddLabel(pnlAdminControls, "■ 保存・ログ設定", yPos, true); yPos += 25;
-            AddLabel(pnlAdminControls, "保存先フォルダ:", yPos); yPos += 20;
-            txtSavePath = new TextBox { Location = new Point(15, yPos), Width = 230, Text = _savePath };
-            Button btnBrowse = new Button { Text = "参照", Location = new Point(250, yPos - 1), Width = 50 };
-            btnBrowse.Click += (s, e) => { using (var fbd = new FolderBrowserDialog()) { if (fbd.ShowDialog() == DialogResult.OK) { txtSavePath.Text = fbd.SelectedPath; Settings_ValueChanged(null, null); } } };
-            pnlAdminControls.Controls.Add(txtSavePath); pnlAdminControls.Controls.Add(btnBrowse); yPos += 30;
+            Button btnGoAdmin = new Button { Text = "管理者設定メニュー ⚙", Location = new Point(15, opY), Width = 240, Height = 45, BackColor = Color.FromArgb(70, 70, 74), FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 11, FontStyle.Bold) };
+            btnGoAdmin.Click += btnGoAdmin_Click;
+            pnlOperator.Controls.Add(btnGoAdmin); opY += 70;
 
-            cmbSaveMode = AddCombo(pnlAdminControls, "画像保存モード:", ref yPos, new[] { "全て保存", "NGのみ保存", "保存しない" }, _saveMode);
-            cmbResizeMode = AddCombo(pnlAdminControls, "画像サイズ縮小:", ref yPos, new[] { "100% (原寸)", "50% (軽量)", "25% (最小)" }, _resizeMode);
-            numDeleteDays = AddNum(pnlAdminControls, "自動削除 (日経過):", ref yPos, _deleteDays, 0, 1);
+            AddLabel(pnlOperator, "■ 保存先 (ルートフォルダ)", opY, true); opY += 30;
+            txtSavePath = new TextBox { Location = new Point(15, opY), Width = 175, Text = AppDomain.CurrentDomain.BaseDirectory };
+            pnlOperator.Controls.Add(txtSavePath);
+            Button btnBrowse = new Button { Text = "...", Location = new Point(195, opY - 1), Width = 50, BackColor = Color.Gray };
+            btnBrowse.Click += (s, e) => { using (var f = new FolderBrowserDialog()) if (f.ShowDialog() == DialogResult.OK) txtSavePath.Text = f.SelectedPath; };
+            pnlOperator.Controls.Add(btnBrowse); opY += 45;
 
-            yPos += 10;
-            AddLabel(pnlAdminControls, "■ 公差・更新設定", yPos, true); yPos += 25;
-            numTargetPitch = AddNum(pnlAdminControls, "ピッチ目標値 (mm):", ref yPos, (decimal)_targetPitch, 2, 0.1m);
-            numTolPlus = AddNum(pnlAdminControls, "上限公差 (+mm):", ref yPos, (decimal)_tolPlus, 2, 0.1m);
-            numTolMinus = AddNum(pnlAdminControls, "下限公差 (-mm):", ref yPos, (decimal)_tolMinus, 2, 0.1m);
-            numTolAngle = AddNum(pnlAdminControls, "許容角度 (±度):", ref yPos, (decimal)_tolAngle, 2, 0.1m);
-            numProcessInterval = AddNum(pnlAdminControls, "画像処理間隔(ms) [100=10fps]:", ref yPos, _processIntervalMs, 0, 10m);
-            numUpdateInterval = AddNum(pnlAdminControls, "文字更新間隔 (ms):", ref yPos, _updateIntervalMs, 0, 100m);
+            tabPageSettings = new TabPage { Text = "Settings", BackColor = Color.FromArgb(30, 30, 30) };
+            Panel pnlSettingsLeft = new Panel { Dock = DockStyle.Left, Width = 460, BackColor = Color.FromArgb(30, 30, 30), ForeColor = Color.White };
+            Panel pnlSettingsRight = new Panel { Dock = DockStyle.Right, Width = 320, BackColor = Color.FromArgb(45, 45, 48), ForeColor = Color.White, AutoScroll = true };
+            tabPageSettings.Controls.Add(pnlSettingsLeft);
+            tabPageSettings.Controls.Add(pnlSettingsRight);
 
-            yPos += 10; AddLabel(pnlAdminControls, "■ キャリブレーション", yPos, true); yPos += 25;
-            numMmTop = AddNum(pnlAdminControls, "上段 mm/Pixel:", ref yPos, (decimal)_mmPerPixelTop, 5, 0.0001m);
-            numYTop = AddNum(pnlAdminControls, "上段 基準Y:", ref yPos, (decimal)_refYTop, 1, 10m);
-            Button btnCalibTop = new Button { Text = "↑ 上段キャリブレーション", Location = new Point(15, yPos), Width = 280, Height = 35 };
-            btnCalibTop.Click += (s, e) => ExecuteCalibration(numMmTop, numYTop); pnlAdminControls.Controls.Add(btnCalibTop); yPos += 45;
-            numMmMid = AddNum(pnlAdminControls, "中段 mm/Pixel:", ref yPos, (decimal)_mmPerPixelMid, 5, 0.0001m);
-            numYMid = AddNum(pnlAdminControls, "中段 基準Y:", ref yPos, (decimal)_refYMid, 1, 10m);
-            Button btnCalibMid = new Button { Text = "− 中段キャリブレーション", Location = new Point(15, yPos), Width = 280, Height = 35 };
-            btnCalibMid.Click += (s, e) => ExecuteCalibration(numMmMid, numYMid); pnlAdminControls.Controls.Add(btnCalibMid); yPos += 45;
-            numMmBot = AddNum(pnlAdminControls, "下段 mm/Pixel:", ref yPos, (decimal)_mmPerPixelBot, 5, 0.0001m);
-            numYBot = AddNum(pnlAdminControls, "下段 基準Y:", ref yPos, (decimal)_refYBot, 1, 10m);
-            Button btnCalibBot = new Button { Text = "↓ 下段キャリブレーション", Location = new Point(15, yPos), Width = 280, Height = 35 };
-            btnCalibBot.Click += (s, e) => ExecuteCalibration(numMmBot, numYBot); pnlAdminControls.Controls.Add(btnCalibBot); yPos += 45;
+            int calY = 20;
+            AddLabel(pnlSettingsLeft, "■ レンズ収差補正（カメラ選択）", calY, true); calY += 30;
+            cmbTargetCamera = AddCombo(pnlSettingsLeft, "校正対象カメラ:", calY, new[] { "Left (左カメラ)", "Right (右カメラ)" }, 0);
+            cmbTargetCamera.SelectedIndexChanged += (s, e) => UpdateCalibLabel();
+            calY += 60;
 
-            yPos += 10; AddLabel(pnlAdminControls, "■ 視野設定 (ROI)", yPos, true); yPos += 25;
-            AddLabel(pnlAdminControls, "ROI X (横位置):", yPos); yPos += 20;
-            trackBarRoiX = new TrackBar { Location = new Point(10, yPos), Width = 200, Maximum = 2448, TickStyle = TickStyle.None, Value = Math.Min(_roiX, 2448) };
-            numRoiX = new NumericUpDown { Location = new Point(215, yPos), Width = 80, Maximum = 4000, Value = _roiX };
-            trackBarRoiX.Scroll += (s, e) => { numRoiX.Value = trackBarRoiX.Value; Settings_ValueChanged(null, null); };
-            numRoiX.ValueChanged += (s, e) => { if (numRoiX.Value <= trackBarRoiX.Maximum) trackBarRoiX.Value = (int)numRoiX.Value; Settings_ValueChanged(null, null); };
-            pnlAdminControls.Controls.Add(trackBarRoiX); pnlAdminControls.Controls.Add(numRoiX); yPos += 40;
-            AddLabel(pnlAdminControls, "ROI Y (縦位置):", yPos); yPos += 20;
-            trackBarRoiY = new TrackBar { Location = new Point(10, yPos), Width = 200, Maximum = 2048, TickStyle = TickStyle.None, Value = Math.Min(_roiY, 2048) };
-            numRoiY = new NumericUpDown { Location = new Point(215, yPos), Width = 80, Maximum = 4000, Value = _roiY };
-            trackBarRoiY.Scroll += (s, e) => { numRoiY.Value = trackBarRoiY.Value; Settings_ValueChanged(null, null); };
-            numRoiY.ValueChanged += (s, e) => { if (numRoiY.Value <= trackBarRoiY.Maximum) trackBarRoiY.Value = (int)numRoiY.Value; Settings_ValueChanged(null, null); };
-            pnlAdminControls.Controls.Add(trackBarRoiY); pnlAdminControls.Controls.Add(numRoiY); yPos += 40;
+            lblCalibStatus = new Label { Location = new Point(15, calY), Width = 430, Height = 120, Font = new Font("Consolas", 10, FontStyle.Regular), BackColor = Color.Black, ForeColor = Color.Lime, Text = "校正データ未読込" };
+            pnlSettingsLeft.Controls.Add(lblCalibStatus); calY += 130;
 
-            numRoiWidth = AddNum(pnlAdminControls, "ROI 幅:", ref yPos, _roiWidth, 0, 1);
-            numRoiHeight = AddNum(pnlAdminControls, "ROI 高さ:", ref yPos, _roiHeight, 0, 1);
+            Button btnCalibTop = new Button { Text = "1. 上部エリア校正実行 (Upper)", Location = new Point(15, calY), Width = 400, Height = 40, BackColor = Color.FromArgb(0, 122, 204), FlatStyle = FlatStyle.Flat };
+            btnCalibTop.Click += (s, e) => Execute3PointCalib(0);
+            pnlSettingsLeft.Controls.Add(btnCalibTop); calY += 50;
+            Button btnCalibMid = new Button { Text = "2. 中央エリア校正実行 (Middle)", Location = new Point(15, calY), Width = 400, Height = 40, BackColor = Color.FromArgb(0, 122, 204), FlatStyle = FlatStyle.Flat };
+            btnCalibMid.Click += (s, e) => Execute3PointCalib(1);
+            pnlSettingsLeft.Controls.Add(btnCalibMid); calY += 50;
+            Button btnCalibBot = new Button { Text = "3. 下部エリア校正実行 (Lower)", Location = new Point(15, calY), Width = 400, Height = 40, BackColor = Color.FromArgb(0, 122, 204), FlatStyle = FlatStyle.Flat };
+            btnCalibBot.Click += (s, e) => Execute3PointCalib(2);
+            pnlSettingsLeft.Controls.Add(btnCalibBot); calY += 70;
+            Button btnCloseAdmin = new Button { Text = "◀ 設定を確定して戻る", Location = new Point(15, calY), Width = 400, Height = 55, BackColor = Color.FromArgb(16, 124, 65), FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 12, FontStyle.Bold) };
+            btnCloseAdmin.Click += btnCloseAdmin_Click;
+            pnlSettingsLeft.Controls.Add(btnCloseAdmin);
 
-            txtSavePath.TextChanged += Settings_ValueChanged; cmbSaveMode.SelectedIndexChanged += Settings_ValueChanged; cmbResizeMode.SelectedIndexChanged += Settings_ValueChanged;
+            int setY = 15;
+            AddLabel(pnlSettingsRight, "■ 計測・公差設定", setY, true); setY += 30;
+            numTarget = AddNum(pnlSettingsRight, "目標値 (ピッチmm):", setY, 180.00m, 2, 0.01m); setY += 65;
+            numTolPlus = AddNum(pnlSettingsRight, "上限公差 (+mm):", setY, 0.30m, 2, 0.01m); setY += 65;
+            numTolMinus = AddNum(pnlSettingsRight, "下限公差 (-mm):", setY, 0.30m, 2, 0.01m); setY += 80;
+
+            AddLabel(pnlSettingsRight, "■ 画像処理設定", setY, true); setY += 30;
+            numThreshold = AddNum(pnlSettingsRight, "二値化閾値 (0-255):", setY, 128m, 0, 1m); numThreshold.Maximum = 255; setY += 65;
+            numMaxAngle = AddNum(pnlSettingsRight, "許容角度 (±度):", setY, 2.0m, 1, 0.1m); setY += 65;
+            numUpdateInterval = AddNum(pnlSettingsRight, "数値更新間隔 (ms):", setY, 500m, 0, 100m); setY += 80;
+
+            AddLabel(pnlSettingsRight, "■ 視野設定 (ROI設定)", setY, true); setY += 30;
+            trackBarRoiX = new TrackBar { Location = new Point(15, setY + 22), Width = 260, Minimum = 0, Maximum = 10000, TickStyle = TickStyle.None };
+            pnlSettingsRight.Controls.Add(trackBarRoiX); setY += 65;
+            numRoiWidth = AddNum(pnlSettingsRight, "X計測幅 (mmサイズ):", setY, 200m, 0); setY += 65;
+            trackBarRoiY = new TrackBar { Location = new Point(15, setY + 22), Width = 260, Minimum = 0, Maximum = 10000, TickStyle = TickStyle.None };
+            pnlSettingsRight.Controls.Add(trackBarRoiY); setY += 65;
+            numRoiHeight = AddNum(pnlSettingsRight, "Y計測高さ (mmサイズ):", setY, 100m, 0); setY += 80;
+
+            AddLabel(pnlSettingsRight, "■ ログ・保存詳細設定", setY, true); setY += 30;
+            cmbSaveImageMode = AddCombo(pnlSettingsRight, "画像保存モード:", setY, new[] { "0: 画像保存しない", "1: NGの時のみ保存", "2: すべて保存" }, 2); setY += 65;
+            cmbSaveScale = AddCombo(pnlSettingsRight, "保存画像サイズ (縮小率):", setY, new[] { "0: 100% (そのまま)", "1: 50% (推奨・容量1/4)", "2: 25% (激軽・容量1/16)" }, 1); setY += 65;
+            numLogKeepDays = AddNum(pnlSettingsRight, "ログ保持日数 (日):", setY, 30m, 0, 1m);
         }
 
-        // --- ヘルパー関数 ---
-        private void AddLabel(Panel p, string t, int y, bool b = false) { Label l = new Label { Text = t, Location = new Point(10, y), AutoSize = true }; if (b) l.Font = new Font("Segoe UI", 10, FontStyle.Bold); p.Controls.Add(l); }
-        private NumericUpDown AddNum(Panel p, string t, ref int y, decimal v, int d, decimal i) { AddLabel(p, t, y); var n = new NumericUpDown { Location = new Point(15, y + 20), Width = 280, DecimalPlaces = d, Increment = i, Maximum = 10000, Value = v }; n.ValueChanged += Settings_ValueChanged; p.Controls.Add(n); y += 45; return n; }
-        private ComboBox AddCombo(Panel p, string t, ref int y, string[] items, int selIdx) { AddLabel(p, t, y); ComboBox c = new ComboBox { Location = new Point(15, y + 20), Width = 280, DropDownStyle = ComboBoxStyle.DropDownList }; c.Items.AddRange(items); c.SelectedIndex = selIdx; p.Controls.Add(c); y += 45; return c; }
-
-        public static string InputBox(string title, string promptText, string value, bool isPassword = false)
+        private void CameraL_OnFrameCaptured(object sender, Mat frame)
         {
-            Form form = new Form { Text = title, ClientSize = new Size(396, 120), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent };
-            Label label = new Label { Text = promptText, Bounds = new Rectangle(10, 20, 360, 13), AutoSize = true };
-            TextBox textBox = new TextBox { Text = value, Bounds = new Rectangle(12, 40, 360, 20) };
-            if (isPassword) textBox.PasswordChar = '*';
-            Button buttonOk = new Button { Text = "OK", DialogResult = DialogResult.OK, Bounds = new Rectangle(210, 75, 75, 30) };
-            Button buttonCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(295, 75, 75, 30) };
-            form.Controls.AddRange(new Control[] { label, textBox, buttonOk, buttonCancel });
-            form.AcceptButton = buttonOk; form.CancelButton = buttonCancel;
-            return form.ShowDialog() == DialogResult.OK ? textBox.Text : "";
+            ProcessCameraFrame(frame, _engineL, true, _mmPerPixelTopL, _mmPerPixelMidL, _mmPerPixelBotL, _refYTopL, _refYMidL, _refYBotL);
         }
 
-        // ==========================================
-        // 3. マウス操作 (ズーム・パン・描画)
-        // ==========================================
-        private void ResetZoom()
+        private void CameraR_OnFrameCaptured(object sender, Mat frame)
         {
-            lock (_bmpLock)
-            {
-                if (_currentDisplayBmp == null || pictureBox1.Width <= 0 || pictureBox1.Height <= 0) return;
-                float scaleX = (float)pictureBox1.Width / _currentDisplayBmp.Width;
-                float scaleY = (float)pictureBox1.Height / _currentDisplayBmp.Height;
-                _zoom = Math.Max(0.01f, Math.Min(scaleX, scaleY));
-                float cx = (pictureBox1.Width - _currentDisplayBmp.Width * _zoom) / 2f;
-                float cy = (pictureBox1.Height - _currentDisplayBmp.Height * _zoom) / 2f;
-                _offset = new PointF(cx, cy);
-            }
-            pictureBox1.Invalidate();
+            ProcessCameraFrame(frame, _engineR, false, _mmPerPixelTopR, _mmPerPixelMidR, _mmPerPixelBotR, _refYTopR, _refYMidR, _refYBotR);
         }
 
-        private void PictureBox1_Paint(object sender, PaintEventArgs e)
-        {
-            lock (_bmpLock)
-            {
-                if (_currentDisplayBmp == null) return;
-                e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                e.Graphics.TranslateTransform(_offset.X, _offset.Y);
-                e.Graphics.ScaleTransform(_zoom, _zoom);
-                e.Graphics.DrawImage(_currentDisplayBmp, new PointF(0, 0));
-            }
-        }
-
-        private void PictureBox1_MouseWheel(object sender, MouseEventArgs e)
-        {
-            float oldZoom = _zoom;
-            if (e.Delta > 0) _zoom *= 1.15f;
-            else _zoom /= 1.15f;
-            _zoom = Math.Max(0.05f, Math.Min(_zoom, 20.0f));
-
-            PointF mousePos = new PointF(e.X, e.Y);
-            _offset.X = mousePos.X - (mousePos.X - _offset.X) * (_zoom / oldZoom);
-            _offset.Y = mousePos.Y - (mousePos.Y - _offset.Y) * (_zoom / oldZoom);
-            pictureBox1.Invalidate();
-        }
-
-        private void PictureBox1_MouseDown(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Middle) { _isDragging = true; _lastMousePos = e.Location; } }
-        private void PictureBox1_MouseMove(object sender, MouseEventArgs e) { if (_isDragging) { _offset.X += (e.X - _lastMousePos.X); _offset.Y += (e.Y - _lastMousePos.Y); _lastMousePos = e.Location; pictureBox1.Invalidate(); } }
-        private void PictureBox1_MouseUp(object sender, MouseEventArgs e) { _isDragging = false; }
-
-        // ==========================================
-        // 4. 管理者ロック・保存・自動削除・設定同期
-        // ==========================================
-        private void BtnAdminLock_Click(object sender, EventArgs e)
-        {
-            if (_isAdmin) { _isAdmin = false; pnlAdminControls.Enabled = false; btnAdminLock.Text = "管理者ロック解除"; btnAdminLock.BackColor = Color.Orange; }
-            else { if (InputBox("管理者ログイン", "パスワード:", "", true) == ADMIN_PASS) { _isAdmin = true; pnlAdminControls.Enabled = true; btnAdminLock.Text = "ロック中 (クリックで施錠)"; btnAdminLock.BackColor = Color.LimeGreen; } else MessageBox.Show("パスワードが違います。", "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error); }
-        }
-
-        protected override bool ProcessCmdKey(ref Message msg, Keys keyData) { if (keyData == Keys.Space) { SaveMeasurementData(); return true; } return base.ProcessCmdKey(ref msg, keyData); }
-
-        private void SaveMeasurementData()
-        {
-            MeasurementResult resToSave = null;
-            Mat matToSave = null;
-
-            lock (_dataLock)
-            {
-                if (_lastResult == null || !_lastResult.IsValid) return;
-                resToSave = _lastResult;
-                if (_lastDispMat != null && !_lastDispMat.IsDisposed)
-                {
-                    matToSave = _lastDispMat.Clone();
-                }
-            }
-
-            bool isPitchOk = (resToSave.PitchMm >= _targetPitch - _tolMinus) && (resToSave.PitchMm <= _targetPitch + _tolPlus);
-            bool isAngleOk = Math.Abs(resToSave.AngleDegree) <= _tolAngle;
-            bool isOk = isPitchOk && isAngleOk;
-
-            if (_saveMode == 2) { matToSave?.Dispose(); return; }
-            if (_saveMode == 1 && isOk) { matToSave?.Dispose(); return; }
-
-            Task.Run(() =>
-            {
-                try
-                {
-                    if (!Directory.Exists(_savePath)) Directory.CreateDirectory(_savePath);
-                    string folderPath = Path.Combine(_savePath, DateTime.Now.ToString("yyyyMMdd"));
-                    if (!Directory.Exists(folderPath)) Directory.CreateDirectory(folderPath);
-
-                    string timeStr = DateTime.Now.ToString("HHmmss");
-                    string judgeStr = isOk ? "OK" : "NG";
-
-                    string csvPath = Path.Combine(folderPath, "InspectionLog.csv");
-                    bool isNew = !File.Exists(csvPath);
-                    using (StreamWriter sw = new StreamWriter(csvPath, true, Encoding.UTF8))
-                    {
-                        if (isNew) sw.WriteLine("時間,判定,ピッチ(mm),左穴径(mm),右穴径(mm),角度(度)");
-                        sw.WriteLine($"{timeStr},{judgeStr},{resToSave.PitchMm:F2},{resToSave.DiameterLeftMm:F2},{resToSave.DiameterRightMm:F2},{resToSave.AngleDegree:F2}");
-                    }
-
-                    if (matToSave != null && !matToSave.IsDisposed)
-                    {
-                        using (Mat saveMat = new Mat())
-                        {
-                            double scale = _resizeMode == 1 ? 0.5 : (_resizeMode == 2 ? 0.25 : 1.0);
-                            if (scale < 1.0) Cv2.Resize(matToSave, saveMat, new OpenCvSharp.Size(0, 0), scale, scale);
-                            Cv2.ImWrite(Path.Combine(folderPath, $"{timeStr}_{judgeStr}.jpg"), scale < 1.0 ? saveMat : matToSave);
-                        }
-                    }
-                }
-                catch (Exception ex) { Console.WriteLine("保存エラー: " + ex.Message); }
-                finally { if (matToSave != null && !matToSave.IsDisposed) matToSave.Dispose(); }
-            });
-        }
-
-        private void DeleteOldLogs()
-        {
-            try { if (!Directory.Exists(_savePath)) return; DateTime threshold = DateTime.Now.AddDays(-_deleteDays); foreach (var d in Directory.GetDirectories(_savePath)) { string fName = Path.GetFileName(d); if (fName.Length == 8 && int.TryParse(fName, out _)) { if (new DateTime(int.Parse(fName.Substring(0, 4)), int.Parse(fName.Substring(4, 2)), int.Parse(fName.Substring(6, 2))) < threshold) Directory.Delete(d, true); } } } catch { }
-        }
-
-        private void ExecuteCalibration(NumericUpDown numMm, NumericUpDown numY)
-        {
-            double px = 0; double cy = 0;
-            lock (_dataLock)
-            {
-                if (_lastResult == null || !_lastResult.IsValid) { MessageBox.Show("有効な測定結果がありません。", "エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-                px = _lastResult.PitchPx; cy = _lastCenterY;
-            }
-
-            string input = InputBox("実寸入力", $"検出ピッチ: {px:F2} px\n実際の寸法(mm)を入力:", "100.0");
-            if (double.TryParse(input, out double actualMm) && actualMm > 0)
-            {
-                double newMmPerPx = actualMm / px;
-                if (newMmPerPx >= (double)numMm.Minimum && newMmPerPx <= (double)numMm.Maximum) numMm.Value = (decimal)newMmPerPx;
-                if (cy >= (double)numY.Minimum && cy <= (double)numY.Maximum) numY.Value = (decimal)cy;
-                Settings_ValueChanged(null, null);
-                MessageBox.Show($"完了しました。\n\n係数: {newMmPerPx:F5} mm/px", "完了", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
-        }
-
-        private void Settings_ValueChanged(object sender, EventArgs e)
-        {
-            if (_isLoadingConfig) return;
-            _savePath = txtSavePath.Text; _saveMode = cmbSaveMode.SelectedIndex; _resizeMode = cmbResizeMode.SelectedIndex; _deleteDays = (int)numDeleteDays.Value;
-            _targetPitch = (double)numTargetPitch.Value; _tolPlus = (double)numTolPlus.Value; _tolMinus = (double)numTolMinus.Value; _tolAngle = (double)numTolAngle.Value;
-            _processIntervalMs = (int)numProcessInterval.Value; _updateIntervalMs = (int)numUpdateInterval.Value;
-            _mmPerPixelTop = (double)numMmTop.Value; _refYTop = (double)numYTop.Value; _mmPerPixelMid = (double)numMmMid.Value; _refYMid = (double)numYMid.Value; _mmPerPixelBot = (double)numMmBot.Value; _refYBot = (double)numYBot.Value;
-            _roiX = (int)numRoiX.Value; _roiY = (int)numRoiY.Value; _roiWidth = (int)numRoiWidth.Value; _roiHeight = (int)numRoiHeight.Value;
-        }
-
-        private void SaveConfig()
-        {
-            try { string path = Path.Combine(Application.StartupPath, "config.txt"); using (StreamWriter sw = new StreamWriter(path, false, Encoding.UTF8)) { sw.WriteLine($"SavePath={_savePath}\nSaveMode={_saveMode}\nResizeMode={_resizeMode}\nDeleteDays={_deleteDays}"); sw.WriteLine($"TargetPitch={_targetPitch}\nTolPlus={_tolPlus}\nTolMinus={_tolMinus}\nTolAngle={_tolAngle}\nProcessInterval={_processIntervalMs}\nUpdateInterval={_updateIntervalMs}"); sw.WriteLine($"MmPerPixelTop={_mmPerPixelTop}\nRefYTop={_refYTop}\nMmPerPixelMid={_mmPerPixelMid}\nRefYMid={_refYMid}\nMmPerPixelBot={_mmPerPixelBot}\nRefYBot={_refYBot}"); sw.WriteLine($"RoiX={_roiX}\nRoiY={_roiY}\nRoiWidth={_roiWidth}\nRoiHeight={_roiHeight}"); } } catch { }
-        }
-
-        private void LoadConfig()
-        {
-            _isLoadingConfig = true;
-            try { string path = Path.Combine(Application.StartupPath, "config.txt"); if (File.Exists(path)) { foreach (string line in File.ReadAllLines(path)) { var parts = line.Split('='); if (parts.Length < 2) continue; string key = parts[0].Trim(), val = parts[1].Trim(); if (key == "SavePath") txtSavePath.Text = val; if (key == "SaveMode" && int.TryParse(val, out int i0)) cmbSaveMode.SelectedIndex = i0; if (key == "ResizeMode" && int.TryParse(val, out int i1)) cmbResizeMode.SelectedIndex = i1; if (key == "DeleteDays" && int.TryParse(val, out int i2)) numDeleteDays.Value = i2; if (key == "TargetPitch" && double.TryParse(val, out double d2)) numTargetPitch.Value = (decimal)d2; if (key == "TolPlus" && double.TryParse(val, out double d3)) numTolPlus.Value = (decimal)d3; if (key == "TolMinus" && double.TryParse(val, out double d4)) numTolMinus.Value = (decimal)d4; if (key == "TolAngle" && double.TryParse(val, out double d5)) numTolAngle.Value = (decimal)d5; if (key == "ProcessInterval" && int.TryParse(val, out int i6)) numProcessInterval.Value = i6; if (key == "UpdateInterval" && int.TryParse(val, out int i3)) numUpdateInterval.Value = i3; if (key == "MmPerPixelTop" && double.TryParse(val, out double mt)) numMmTop.Value = (decimal)mt; if (key == "RefYTop" && double.TryParse(val, out double yt)) numYTop.Value = (decimal)yt; if (key == "MmPerPixelMid" && double.TryParse(val, out double mm)) numMmMid.Value = (decimal)mm; if (key == "RefYMid" && double.TryParse(val, out double ym)) numYMid.Value = (decimal)ym; if (key == "MmPerPixelBot" && double.TryParse(val, out double mb)) numMmBot.Value = (decimal)mb; if (key == "RefYBot" && double.TryParse(val, out double yb)) numYBot.Value = (decimal)yb; if (key == "RoiX" && int.TryParse(val, out int r1)) { numRoiX.Value = r1; if (r1 <= trackBarRoiX.Maximum) trackBarRoiX.Value = r1; } if (key == "RoiY" && int.TryParse(val, out int r2)) { numRoiY.Value = r2; if (r2 <= trackBarRoiY.Maximum) trackBarRoiY.Value = r2; } if (key == "RoiWidth" && int.TryParse(val, out int r3)) numRoiWidth.Value = r3; if (key == "RoiHeight" && int.TryParse(val, out int r4)) numRoiHeight.Value = r4; } } } catch { } finally { _isLoadingConfig = false; Settings_ValueChanged(null, null); }
-        }
-
-        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            SaveConfig(); camera?.Terminate();
-            if (_lastDispMat != null && !_lastDispMat.IsDisposed) _lastDispMat.Dispose();
-            if (_currentDisplayBmp != null) _currentDisplayBmp.Dispose();
-        }
-
-        // ==========================================
-        // 5. 画像処理メイン: カメラからの映像受信
-        // ==========================================
-        private void Camera_OnFrameCaptured(object sender, Mat frame)
+        private void ProcessCameraFrame(Mat frame, MeasurementEngine engine, bool isLeft,
+                                        double mTop, double mMid, double mBot, double yTop, double yMid, double yBot)
         {
             try
             {
-                if (!_isCapturing || frame == null || frame.IsDisposed) return;
+                double target = 0, tolPlus = 0, tolMinus = 0, maxAngle = 1.0, intervalMs = 500;
+                int rX = 0, rY = 0, rW_px = 50, rH_px = 50, threshVal = 128;
 
-                if ((DateTime.Now - _lastProcessTime).TotalMilliseconds < _processIntervalMs)
+                this.Invoke(new Action(() => {
+                    rW_px = Math.Max(1, (int)(numRoiWidth.Value / (decimal)mMid));
+                    rH_px = Math.Max(1, (int)(numRoiHeight.Value / (decimal)mMid));
+                    int maxPosX = Math.Max(0, frame.Cols - rW_px);
+                    if (trackBarRoiX.Maximum != maxPosX) trackBarRoiX.Maximum = maxPosX;
+                    int maxPosY = Math.Max(0, frame.Rows - rH_px);
+                    if (trackBarRoiY.Maximum != maxPosY) trackBarRoiY.Maximum = maxPosY;
+
+                    target = (double)numTarget.Value;
+                    tolPlus = (double)numTolPlus.Value;
+                    tolMinus = (double)numTolMinus.Value;
+                    maxAngle = (double)numMaxAngle.Value;
+                    intervalMs = (double)numUpdateInterval.Value;
+                    threshVal = (int)numThreshold.Value;
+                    rX = trackBarRoiX.Value;
+                    rY = trackBarRoiY.Value;
+                }));
+
+                using (Mat drawMat = new Mat())
                 {
-                    return;
-                }
-                _lastProcessTime = DateTime.Now;
+                    Cv2.CvtColor(frame, drawMat, ColorConversionCodes.GRAY2BGR);
 
-                using (Mat dispMat = new Mat())
-                using (Mat frameGray = new Mat())
-                {
-                    if (frame.Channels() == 3) { frame.CopyTo(dispMat); Cv2.CvtColor(frame, frameGray, ColorConversionCodes.BGR2GRAY); }
-                    else { Cv2.CvtColor(frame, dispMat, ColorConversionCodes.GRAY2BGR); frame.CopyTo(frameGray); }
+                    int safeW = (int)(frame.Cols * 0.66);
+                    int safeH = (int)(frame.Rows * 0.66);
+                    Rect safeRect = new Rect((frame.Cols - safeW) / 2, (frame.Rows - safeH) / 2, safeW, safeH);
+                    Cv2.Rectangle(drawMat, safeRect, Scalar.Yellow, 3, LineTypes.AntiAlias);
+                    Cv2.PutText(drawMat, "50um Guaranteed Area", new CvPoint(safeRect.X + 10, safeRect.Y + 40), HersheyFonts.HersheyComplex, 1.2, Scalar.Yellow, 2);
 
-                    var result = MeasurementCore.ProcessFrame(frameGray, dispMat, _roiX, _roiY, _roiWidth, _roiHeight, _mmPerPixelTop, _mmPerPixelMid, _mmPerPixelBot, _refYTop, _refYMid, _refYBot);
+                    var resObj = engine.ProcessFrame(frame, drawMat, rX, rY, rW_px, rH_px, mTop, mMid, mBot, yTop, yMid, yBot, threshVal);
 
-                    Bitmap nextBmp = BitmapConverter.ToBitmap(dispMat);
+                    if (resObj.IsValid)
+                    {
+                        bool angleOk = Math.Abs(resObj.AngleDegree) <= maxAngle;
+                        bool sizeOk = (resObj.MeasuredValueMm >= target - tolMinus) && (resObj.MeasuredValueMm <= target + tolPlus);
+                        bool isTotalOk = angleOk && sizeOk;
+
+                        if (isLeft) { _lastPxL = resObj.MeasuredValuePx; _currentValL = resObj.MeasuredValueMm; _lastCenterYL = resObj.CenterY; _isOkL = isTotalOk; }
+                        else { _lastPxR = resObj.MeasuredValuePx; _currentValR = resObj.MeasuredValueMm; _lastCenterYR = resObj.CenterY; _isOkR = isTotalOk; }
+
+                        if ((DateTime.Now - _lastTextUpdate).TotalMilliseconds >= intervalMs)
+                        {
+                            UpdateBigResultLabel();
+                            _lastTextUpdate = DateTime.Now;
+                        }
+
+                        string text = $"{(isTotalOk ? "OK" : "NG")} PITCH: {resObj.MeasuredValueMm:F3}mm";
+                        Scalar color = isTotalOk ? Scalar.Lime : Scalar.Red;
+                        Cv2.PutText(drawMat, text, new CvPoint(50, 150), HersheyFonts.HersheyComplex, 3.0, color, 6);
+                        Cv2.PutText(drawMat, $"L_DIA: {resObj.LeftHoleDiaMm:F2}mm", new CvPoint(50, 220), HersheyFonts.HersheyComplex, 1.5, Scalar.Cyan, 3);
+                        Cv2.PutText(drawMat, $"R_DIA: {resObj.RightHoleDiaMm:F2}mm", new CvPoint(50, 290), HersheyFonts.HersheyComplex, 1.5, Scalar.Cyan, 3);
+                    }
+
+                    Bitmap next = BitmapConverter.ToBitmap(drawMat);
                     lock (_bmpLock)
                     {
-                        var oldBmp = _currentDisplayBmp;
-                        _currentDisplayBmp = nextBmp;
-                        if (oldBmp != null) oldBmp.Dispose();
+                        if (isLeft) { var old = _bmpL; _bmpL = next; old?.Dispose(); }
+                        else { var old = _bmpR; _bmpR = next; old?.Dispose(); }
                     }
 
-                    if (_isFirstFrame) { _isFirstFrame = false; this.BeginInvoke(new Action(ResetZoom)); }
-                    else { pictureBox1.BeginInvoke(new Action(() => pictureBox1.Invalidate())); }
+                    PictureBox targetPic = isLeft ? picLeft : picRight;
+                    if (targetPic.IsHandleCreated) targetPic.BeginInvoke(new Action(() => targetPic.Image = isLeft ? _bmpL : _bmpR));
+                }
+            }
+            catch { }
+            finally { frame.Dispose(); }
+        }
 
-                    if (result.HasProduct)
+        private void UpdateBigResultLabel()
+        {
+            this.BeginInvoke(new Action(() => {
+                if (_isOkL && _isOkR) { lblBigResult.Text = "ALL OK"; lblBigResult.BackColor = Color.LimeGreen; lblBigResult.ForeColor = Color.White; }
+                else { lblBigResult.Text = "NG DETECTED"; lblBigResult.BackColor = Color.Crimson; lblBigResult.ForeColor = Color.White; }
+            }));
+        }
+
+        private void SaveData()
+        {
+            try
+            {
+                string rootPath = txtSavePath.Text;
+                if (string.IsNullOrWhiteSpace(rootPath)) return;
+                if (!Directory.Exists(rootPath)) Directory.CreateDirectory(rootPath);
+
+                string dateStr = DateTime.Now.ToString("yyyyMMdd");
+                string dailyDir = Path.Combine(rootPath, dateStr);
+                if (!Directory.Exists(dailyDir)) Directory.CreateDirectory(dailyDir);
+
+                double target = (double)numTarget.Value;
+                string resultStrL = _isOkL ? "OK" : "NG";
+                string resultStrR = _isOkR ? "OK" : "NG";
+                string finalResult = (_isOkL && _isOkR) ? "OK" : "NG";
+                string timeStr = DateTime.Now.ToString("HHmmss_fff");
+
+                string csvPath = Path.Combine(dailyDir, "InspectionLog.csv");
+                bool isNew = !File.Exists(csvPath);
+                using (var sw = new StreamWriter(csvPath, true, Encoding.UTF8))
+                {
+                    if (isNew) sw.WriteLine("Time,TargetPitch,L_Measured,L_Result,R_Measured,R_Result,Total");
+                    sw.WriteLine($"{DateTime.Now:HH:mm:ss},{target:F2},{_currentValL:F3},{resultStrL},{_currentValR:F3},{resultStrR},{finalResult}");
+                }
+
+                int saveMode = cmbSaveImageMode.SelectedIndex;
+                bool shouldSaveImage = (saveMode == 2) || (saveMode == 1 && finalResult == "NG");
+
+                if (shouldSaveImage)
+                {
+                    string imgDir = Path.Combine(dailyDir, "Images");
+                    if (!Directory.Exists(imgDir)) Directory.CreateDirectory(imgDir);
+
+                    string imgPath = Path.Combine(imgDir, $"{timeStr}_L-{resultStrL}_R-{resultStrR}.jpg");
+
+                    lock (_bmpLock)
                     {
-                        lock (_dataLock)
+                        if (_bmpL != null && _bmpR != null)
                         {
-                            var oldMat = _lastDispMat;
-                            _lastDispMat = dispMat.Clone();
-                            if (oldMat != null && !oldMat.IsDisposed) oldMat.Dispose();
+                            using (Mat matL = BitmapConverter.ToMat(_bmpL))
+                            using (Mat matR = BitmapConverter.ToMat(_bmpR))
+                            using (Mat combined = new Mat())
+                            {
+                                Cv2.HConcat(new Mat[] { matL, matR }, combined);
+                                int scaleMode = cmbSaveScale.SelectedIndex;
+                                float scale = scaleMode == 2 ? 0.25f : (scaleMode == 1 ? 0.5f : 1.0f);
 
-                            _lastResult = result;
-                            _lastCenterY = (result.CenterLeft.Y + result.CenterRight.Y) / 2.0;
+                                if (scale < 1.0f)
+                                {
+                                    using (Mat resized = new Mat())
+                                    {
+                                        Cv2.Resize(combined, resized, new OpenCvSharp.Size((int)(combined.Width * scale), (int)(combined.Height * scale)));
+                                        resized.SaveImage(imgPath);
+                                    }
+                                }
+                                else { combined.SaveImage(imgPath); }
+                            }
                         }
                     }
+                }
 
-                    if ((DateTime.Now - _lastUiUpdate).TotalMilliseconds >= _updateIntervalMs)
+                pnlCameraViews.BackColor = Color.White;
+                Timer t = new Timer { Interval = 100 };
+                t.Tick += (s, e) => { pnlCameraViews.BackColor = Color.Black; t.Stop(); };
+                t.Start();
+
+                int keepDays = (int)numLogKeepDays.Value;
+                Task.Run(() => DeleteOldLogs(rootPath, keepDays));
+            }
+            catch (Exception ex) { MessageBox.Show($"保存エラー: {ex.Message}"); }
+        }
+
+        private void DeleteOldLogs(string rootPath, int keepDays)
+        {
+            try
+            {
+                if (!Directory.Exists(rootPath)) return;
+                var dirs = Directory.GetDirectories(rootPath);
+                DateTime limit = DateTime.Now.Date.AddDays(-keepDays);
+                foreach (var dir in dirs)
+                {
+                    string dirName = new DirectoryInfo(dir).Name;
+                    if (dirName.Length == 8 && int.TryParse(dirName, out _) && DateTime.TryParseExact(dirName, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out DateTime dirDate))
                     {
-                        _lastUiUpdate = DateTime.Now;
-
-                        this.BeginInvoke(new Action(() =>
-                        {
-                            // ★ ソフトウェアトリガー（HasProduct）によるWAIT表示の切り替え
-                            if (!result.HasProduct)
-                            {
-                                lblPitch.Text = "ピッチ: --- mm"; lblDiameterL.Text = "左穴径: --- mm"; lblDiameterR.Text = "右穴径: --- mm"; lblAngle.Text = "角度: --- 度";
-                                lblBigResult.Text = "WAIT"; lblBigResult.BackColor = Color.Gray;
-                            }
-                            else if (result.IsValid)
-                            {
-                                double pMm = result.PitchMm;
-                                double dL = result.DiameterLeftMm;
-                                double dR = result.DiameterRightMm;
-                                double ang = result.AngleDegree;
-
-                                lblPitch.Text = $"ピッチ: {pMm:F2} mm"; lblDiameterL.Text = $"左穴径: {dL:F2} mm"; lblDiameterR.Text = $"右穴径: {dR:F2} mm"; lblAngle.Text = $"角度: {ang:F2} 度";
-
-                                bool isPitchOk = (pMm >= _targetPitch - _tolMinus) && (pMm <= _targetPitch + _tolPlus);
-                                bool isAngleOk = Math.Abs(ang) <= _tolAngle;
-                                bool isAllOk = isPitchOk && isAngleOk;
-
-                                lblBigResult.Text = isAllOk ? "OK" : "NG"; lblBigResult.BackColor = isAllOk ? Color.LimeGreen : Color.Red;
-                            }
-                            else
-                            {
-                                lblPitch.Text = "ピッチ: --- mm"; lblDiameterL.Text = "左穴径: --- mm"; lblDiameterR.Text = "右穴径: --- mm"; lblAngle.Text = "角度: --- 度";
-                                lblBigResult.Text = "NG"; lblBigResult.BackColor = Color.Red;
-                            }
-                        }));
+                        if (dirDate < limit) Directory.Delete(dir, true);
                     }
                 }
             }
-            catch (Exception ex) { Console.WriteLine("処理エラー: " + ex.Message); }
-            finally { if (frame != null && !frame.IsDisposed) frame.Dispose(); }
+            catch { }
         }
+
+        private void btnGoAdmin_Click(object sender, EventArgs e)
+        {
+            string pass = InputBox("認証確認", "管理者パスワード:", "");
+            if (pass == AdminPassword)
+            {
+                UpdateCalibLabel();
+                if (!mainTabControl.TabPages.Contains(tabPageSettings)) mainTabControl.TabPages.Add(tabPageSettings);
+                mainTabControl.SelectedTab = tabPageSettings;
+                pnlCameraViews.Parent = tabPageSettings;
+                pnlCameraViews.BringToFront();
+            }
+            else if (!string.IsNullOrEmpty(pass)) { MessageBox.Show("パスワード不一致"); }
+        }
+
+        private void btnCloseAdmin_Click(object sender, EventArgs e)
+        {
+            SaveAppConfig();
+            mainTabControl.SelectedTab = tabPageMain;
+            if (mainTabControl.TabPages.Contains(tabPageSettings)) mainTabControl.TabPages.Remove(tabPageSettings);
+            pnlCameraViews.Parent = tabPageMain;
+            pnlCameraViews.BringToFront();
+        }
+
+        private void Execute3PointCalib(int type)
+        {
+            bool isLeft = cmbTargetCamera.SelectedIndex == 0;
+            double targetPx = isLeft ? _lastPxL : _lastPxR;
+            double targetY = isLeft ? _lastCenterYL : _lastCenterYR;
+            if (targetPx <= 0) { MessageBox.Show("計測データが取得できていません。"); return; }
+            string v = InputBox("3点位置校正", $"現在のY座標({targetY:F0}px)での実寸(mm):", "");
+            if (double.TryParse(v, out double mm) && mm > 0)
+            {
+                double ratio = mm / targetPx;
+                if (isLeft)
+                {
+                    if (type == 0) { _mmPerPixelTopL = ratio; _refYTopL = targetY; }
+                    else if (type == 1) { _mmPerPixelMidL = ratio; _refYMidL = targetY; }
+                    else if (type == 2) { _mmPerPixelBotL = ratio; _refYBotL = targetY; }
+                }
+                else
+                {
+                    if (type == 0) { _mmPerPixelTopR = ratio; _refYTopR = targetY; }
+                    else if (type == 1) { _mmPerPixelMidR = ratio; _refYMidR = targetY; }
+                    else if (type == 2) { _mmPerPixelBotR = ratio; _refYBotR = targetY; }
+                }
+                SaveAppConfig();
+                UpdateCalibLabel(); MessageBox.Show("校正値を更新しました。");
+            }
+        }
+
+        private void UpdateCalibLabel()
+        {
+            bool isLeft = cmbTargetCamera.SelectedIndex == 0;
+            if (isLeft) lblCalibStatus.Text = $"【左カメラ 補正ステータス】\n上部: 基準Y={_refYTopL:F0} px -> 係数={_mmPerPixelTopL:F6}\n中央: 基準Y={_refYMidL:F0} px -> 係数={_mmPerPixelMidL:F6}\n下部: 基準Y={_refYBotL:F0} px -> 係数={_mmPerPixelBotL:F6}";
+            else lblCalibStatus.Text = $"【右カメラ 補正ステータス】\n上部: 基準Y={_refYTopR:F0} px -> 係数={_mmPerPixelTopR:F6}\n中央: 基準Y={_refYMidR:F0} px -> 係数={_mmPerPixelMidR:F6}\n下部: 基準Y={_refYBotR:F0} px -> 係数={_mmPerPixelBotR:F6}";
+        }
+
+        private void SaveAppConfig()
+        {
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.txt");
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine($"{_mmPerPixelTopL},{_mmPerPixelMidL},{_mmPerPixelBotL},{_refYTopL},{_refYMidL},{_refYBotL}");
+                sb.AppendLine($"{_mmPerPixelTopR},{_mmPerPixelMidR},{_mmPerPixelBotR},{_refYTopR},{_refYMidR},{_refYBotR}");
+                sb.AppendLine($"{trackBarRoiX.Value},{trackBarRoiY.Value},{numRoiWidth.Value},{numRoiHeight.Value}");
+                sb.AppendLine($"{numTarget.Value},{numTolPlus.Value},{numTolMinus.Value},{numMaxAngle.Value},{numUpdateInterval.Value},{numThreshold.Value}");
+                sb.AppendLine($"{cmbSaveImageMode.SelectedIndex},{numLogKeepDays.Value},{cmbSaveScale.SelectedIndex}");
+                File.WriteAllText(path, sb.ToString());
+            }
+            catch { }
+        }
+
+        private void LoadAppConfig()
+        {
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.txt");
+                if (File.Exists(path))
+                {
+                    string[] lines = File.ReadAllLines(path);
+                    if (lines.Length >= 4)
+                    {
+                        var l1 = lines[0].Split(','); _mmPerPixelTopL = double.Parse(l1[0]); _mmPerPixelMidL = double.Parse(l1[1]); _mmPerPixelBotL = double.Parse(l1[2]); _refYTopL = double.Parse(l1[3]); _refYMidL = double.Parse(l1[4]); _refYBotL = double.Parse(l1[5]);
+                        var l2 = lines[1].Split(','); _mmPerPixelTopR = double.Parse(l2[0]); _mmPerPixelMidR = double.Parse(l2[1]); _mmPerPixelBotR = double.Parse(l2[2]); _refYTopR = double.Parse(l2[3]); _refYMidR = double.Parse(l2[4]); _refYBotR = double.Parse(l2[5]);
+                        var l3 = lines[2].Split(','); trackBarRoiX.Value = int.Parse(l3[0]); trackBarRoiY.Value = int.Parse(l3[1]); numRoiWidth.Value = decimal.Parse(l3[2]); numRoiHeight.Value = decimal.Parse(l3[3]);
+
+                        var l4 = lines[3].Split(',');
+                        numTarget.Value = decimal.Parse(l4[0]); numTolPlus.Value = decimal.Parse(l4[1]); numTolMinus.Value = decimal.Parse(l4[2]); numMaxAngle.Value = decimal.Parse(l4[3]); numUpdateInterval.Value = decimal.Parse(l4[4]);
+                        if (l4.Length > 5) numThreshold.Value = decimal.Parse(l4[5]);
+
+                        var l5 = lines[4].Split(','); cmbSaveImageMode.SelectedIndex = int.Parse(l5[0]); numLogKeepDays.Value = decimal.Parse(l5[1]); cmbSaveScale.SelectedIndex = int.Parse(l5[2]);
+                    }
+                }
+                UpdateCalibLabel();
+            }
+            catch { }
+        }
+
+        private void AddLabel(Panel p, string t, int y, bool b = false) { Label l = new Label { Text = t, Location = new Point(10, y), AutoSize = true }; if (b) l.Font = new Font("Segoe UI", 10, FontStyle.Bold); p.Controls.Add(l); }
+        private NumericUpDown AddNum(Panel p, string t, int y, decimal v, int d, decimal i = 1) { AddLabel(p, t, y); var n = new NumericUpDown { Location = new Point(15, y + 20), Width = 230, DecimalPlaces = d, Increment = i, Minimum = 0, Maximum = 10000 }; n.Value = v; p.Controls.Add(n); return n; }
+        private ComboBox AddCombo(Panel p, string t, int y, string[] items, int selectedIndex) { AddLabel(p, t, y); ComboBox cmb = new ComboBox { Location = new Point(15, y + 20), Width = 230, DropDownStyle = ComboBoxStyle.DropDownList }; cmb.Items.AddRange(items); if (items.Length > selectedIndex) cmb.SelectedIndex = selectedIndex; p.Controls.Add(cmb); return cmb; }
+        public static string InputBox(string t, string p, string v) { Form f = new Form { Text = t, Width = 300, Height = 150, StartPosition = FormStartPosition.CenterScreen, FormBorderStyle = FormBorderStyle.FixedDialog }; Label l = new Label { Text = p, Left = 10, Top = 10, AutoSize = true }; TextBox tx = new TextBox { Text = v, Left = 10, Top = 30, Width = 250 }; Button b = new Button { Text = "OK", Left = 180, Top = 70, DialogResult = DialogResult.OK }; f.Controls.AddRange(new Control[] { l, tx, b }); return f.ShowDialog() == DialogResult.OK ? tx.Text : ""; }
     }
 }
