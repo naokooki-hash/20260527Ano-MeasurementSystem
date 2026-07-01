@@ -96,7 +96,7 @@ namespace MeasurementSystem
                     var largestLocal = localContours.OrderByDescending(c => Cv2.ContourArea(c)).First();
                     if (largestLocal.Length >= 5)
                     {
-                        if (TryCalculateCircle3Point(largestLocal, out CalculatedCircle calculatedCircle))
+                        if (TryCalculateCircle(largestLocal, out CalculatedCircle calculatedCircle))
                         {
                             calculatedCircle.Center.X += rect.X;
                             calculatedCircle.Center.Y += rect.Y;
@@ -163,39 +163,22 @@ namespace MeasurementSystem
             return result;
         }
 
-        private bool TryCalculateCircle3Point(CvPoint[] contour, out CalculatedCircle circle)
+        private bool TryCalculateCircle(CvPoint[] contour, out CalculatedCircle circle)
         {
             circle = new CalculatedCircle();
-            if (contour == null || contour.Length < 3) return false;
+            if (contour == null || contour.Length < 5) return false;
 
             int minY = contour.Min(p => p.Y);
             int maxY = contour.Max(p => p.Y);
             double midY = minY + (maxY - minY) / 2.0;
 
             var upperPoints = contour.Where(p => p.Y < midY).ToList();
-            if (upperPoints.Count < 3) return false;
+            if (upperPoints.Count < 5) return false;
 
-            int count = upperPoints.Count;
-            CvPoint p1 = upperPoints[0];
-            CvPoint p2 = upperPoints[count / 2];
-            CvPoint p3 = upperPoints[count - 1];
+            var rotatedRect = Cv2.FitEllipse(upperPoints);
 
-            double x1 = p1.X, y1 = p1.Y;
-            double x2 = p2.X, y2 = p2.Y;
-            double x3 = p3.X, y3 = p3.Y;
-
-            double a = x1 * (y2 - y3) - y1 * (x2 - x3) + x2 * y3 - x3 * y2;
-            if (Math.Abs(a) < 1e-5) return false;
-
-            double x1_sq = x1 * x1 + y1 * y1;
-            double x2_sq = x2 * x2 + y2 * y2;
-            double x3_sq = x3 * x3 + y3 * y3;
-
-            double cx = (x1_sq * (y2 - y3) + x2_sq * (y3 - y1) + x3_sq * (y1 - y2)) / (2 * a);
-            double cy = (x1_sq * (x3 - x2) + x2_sq * (x1 - x3) + x3_sq * (x2 - x1)) / (2 * a);
-
-            circle.Center = new Point2f((float)cx, (float)cy);
-            circle.Radius = Math.Sqrt((x1 - cx) * (x1 - cx) + (y1 - cy) * (y1 - cy));
+            circle.Center = rotatedRect.Center;
+            circle.Radius = (rotatedRect.Size.Width + rotatedRect.Size.Height) / 4.0;
 
             return true;
         }
